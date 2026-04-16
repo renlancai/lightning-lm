@@ -3,22 +3,47 @@
 ## 总体架构
 
 ```
-原始消息 → 预处理 → IMU同步 → 去畸变 → ESKF迭代更新 → 地图更新 → 关键帧 → 回环检测
+原始消息 → 适配器转换 → 预处理 → IMU同步 → 去畸变 → ESKF迭代更新 → 地图更新 → 关键帧 → 回环检测
 ```
 
-核心模块调用链：
+核心模块调用链（重构后）：
 
 ```
-SlamSystem
-  ├── LaserMapping (lio_)         ← LIO 前端
+SlamEngine (core/engine/)         ← 平台无关 SLAM 编排器（零 ROS 依赖头文件）
+  ├── LaserMapping (lio/)         ← LIO 前端
   │     ├── PointCloudPreprocess  ← 点云预处理
-  │     ├── ImuProcess (p_imu_)   ← IMU 同步 + 去畸变
+  │     ├── ImuProcess (p_imu_)   ← IMU 初始化 + 去畸变委托
+  │     ├── LidarPipeline         ← Phase 2: 去畸变/观测/地图更新（无 ROS）
+  │     │     ├── UndistortFrame  ← 从 ImuProcess::UndistortPcl 迁出
+  │     │     ├── BuildObservation← 从 LaserMapping::ObsModel 迁出
+  │     │     └── UpdateMap       ← 从 LaserMapping::MapIncremental 迁出
+  │     ├── LocalMap              ← Phase 1: 线程安全 IVox 包装
   │     ├── ESKF (kf_)            ← 状态估计
-  │     └── IVox (ivox_)          ← 局部点云地图
+  │     └── IVox (via LocalMap)   ← 局部点云地图
   ├── LoopClosing (lc_)           ← 回环检测 + 位姿图优化
   ├── G2P5 (g2p5_)                ← 2D 栅格地图
   └── PangolinWindow (ui_)        ← 可视化
+
+LocEngine (core/engine/)          ← 平台无关定位编排器
+  ├── Localization (loc/)         ← 定位管线（LIO + lidar_loc + PGO）
+  └── GnssRtkHandler              ← Phase 4: RTK/GNSS 四层假固检测
 ```
+
+---
+
+## 0. 双库架构与 ROS 隔离
+
+项目分为两个库：
+
+| 库 | 类型 | ROS 依赖 | 内容 |
+|----|------|---------|------|
+| `lightning_core` | STATIC | 无 | 纯 C++17 算法：ESKF、LoopClosing、LidarPipeline、LocalMap、GnssRtkHandler、PGO、TiledMap 等 |
+| `lightning.libs` | SHARED | 需要 | ROS 薄层：LaserMapping、PointCloudPreprocess、SlamEngine/LocEngine 实现、BagIO、UI |
+
+**规则**：
+- `adapter/ros2/ros2_converter.{h,cc}` 是**唯一**可以 include ROS 消息头文件的源文件
+- `core/engine/slam_engine.h` 和 `loc_engine.h` 头文件零 ROS include
+- 平台无关类型定义在 `core/types/platform_types.h`：`ImuFrame`、`PointCloudFrame`、`GnssRtkFrame`、`RawPoint`
 
 ---
 
@@ -26,21 +51,33 @@ SlamSystem
 
 ### 在线模式 (`run_slam_online.cc`)
 
+重构后使用 `SlamEngine` + `adapter::ros2` 转换层：
+
 ```cpp
-SlamSystem::Options options;
-options.online_mode_ = true;
-SlamSystem slam(options);
-slam.Init(FLAGS_config);
-slam.StartSLAM("new_map");
-slam.Spin();  // ROS2 事件循环
+// 创建引擎（零 ROS 头文件）
+core::SlamEngine::Options eng_opts;
+eng_opts.online_mode_ = true;
+auto engine = std::make_shared<core::SlamEngine>(eng_opts);
+engine->Init(FLAGS_config);
+engine->StartMapping("new_map");
+
+// ROS 2 订阅 → 平台无关类型 → Engine
+auto imu_sub = node->create_subscription<sensor_msgs::msg::Imu>(
+    imu_topic, qos, [&engine](auto msg) {
+        engine->FeedImu(adapter::ros2::FromImu(*msg));  // Imu → ImuFrame
+    });
+
+auto cloud_sub = node->create_subscription<sensor_msgs::msg::PointCloud2>(
+    cloud_topic, qos, [&engine, time_scale](auto msg) {
+        engine->FeedLidar(adapter::ros2::FromPointCloud2(*msg, time_scale));
+    });
 ```
 
-`SlamSystem::Init()` 中建立订阅：
-- `sensor_msgs::msg::PointCloud2` → `SlamSystem::ProcessLidar()`
-- `livox_ros_driver2::msg::CustomMsg` → `SlamSystem::ProcessLidar()`（Livox 专用）
-- `sensor_msgs::msg::Imu` → `SlamSystem::ProcessIMU()`
+`SlamEngine::FeedImu()` / `FeedLidar()` 接受平台无关的 `core::ImuFrame` / `core::PointCloudFrame`，内部转换为 `IMUPtr` / `CloudPtr` 后推入 `LaserMapping`。
 
 ### 离线模式 (`run_slam_offline.cc`)
+
+仍通过 `SlamSystem`（ROS 耦合）读取 bag：
 
 ```cpp
 RosbagIO rosbag(FLAGS_input_bag);
@@ -51,37 +88,67 @@ rosbag
     .AddPointCloud2Handle(lidar_topic, [&slam](auto msg) {
         slam.ProcessLidar(msg); return true;
     })
-    .Go();  // 顺序遍历 bag，无 Spin
+    .Go();  // 顺序遍历 db3
 ```
 
-`RosbagIO::Go()` 直接读取 sqlite3 db3 文件，反序列化每条消息后调用注册回调。IMU 消息在此处转换为内部 `IMUPtr` 结构体（`linear_acceleration`, `angular_velocity`, `timestamp`）。
+### 适配器转换函数 (`adapter/ros2/ros2_converter`)
+
+| 函数 | 输入 | 输出 |
+|------|------|------|
+| `FromImu()` | `sensor_msgs::msg::Imu` | `core::ImuFrame` |
+| `FromPointCloud2()` | `sensor_msgs::msg::PointCloud2` | `core::PointCloudFrame` |
+| `FromNavSatFix()` | `sensor_msgs::msg::NavSatFix` | `core::GnssRtkFrame` |
+| `LocResultToGeoMsg()` | `LocalizationResult` | `geometry_msgs::msg::TransformStamped` |
 
 ---
 
-## 2. SlamSystem 消息分发
+## 2. SlamEngine 消息分发
 
-### IMU
+### FeedImu
 
 ```cpp
-void SlamSystem::ProcessIMU(const lightning::IMUPtr& imu) {
-    lio_->ProcessIMU(imu);  // 直接推入 imu_buffer_
+void SlamEngine::FeedImu(const ImuFrame& imu) {
+    auto imu_ptr = std::make_shared<IMU>();
+    imu_ptr->timestamp           = imu.timestamp_sec;
+    imu_ptr->linear_acceleration = imu.acc;
+    imu_ptr->angular_velocity    = imu.gyro;
+    lio_->ProcessIMU(imu_ptr);  // 推入 imu_buffer_，在线模式下高频外推 kf_imu_
 }
 ```
 
-### 点云
+### FeedLidar
 
 ```cpp
-void SlamSystem::ProcessLidar(const sensor_msgs::msg::PointCloud2::SharedPtr& cloud) {
+void SlamEngine::FeedLidar(const PointCloudFrame& frame) {
+    // PointCloudFrame → PCL CloudPtr
+    CloudPtr cloud(new PointCloudType());
+    cloud->header.stamp = frame.timestamp_sec * 1e9;  // ns
+    for (const auto& p : frame.points) {
+        PointType pt;
+        pt.x = p.x; pt.y = p.y; pt.z = p.z;
+        pt.intensity = p.intensity;
+        pt.time = p.time_offset_sec;  // 注意：这里存的是秒，不是毫秒
+        cloud->push_back(pt);
+    }
+
     lio_->ProcessPointCloud2(cloud);  // 预处理 → lidar_buffer_
-    lio_->Run();                      // 触发主处理循环
+    lio_->Run();                      // 主处理循环
 
     auto kf = lio_->GetKeyframe();
     if (kf != cur_kf_) {
         cur_kf_ = kf;
-        if (lc_)    lc_->AddKF(cur_kf_);        // 送回环检测
-        if (g2p5_)  g2p5_->PushKeyframe(cur_kf_); // 送栅格地图
-        if (ui_)    ui_->UpdateKF(cur_kf_);      // 更新 UI
+        HandleNewKeyframe(cur_kf_);  // 分发给回环/栅格/UI
     }
+}
+```
+
+### HandleNewKeyframe
+
+```cpp
+void SlamEngine::HandleNewKeyframe(Keyframe::Ptr kf) {
+    if (lc_)   lc_->AddKF(kf);           // 回环检测
+    if (g2p5_) g2p5_->PushKeyframe(kf);  // 2D 栅格
+    if (ui_)   ui_->UpdateKF(kf);        // 可视化
 }
 ```
 
@@ -135,7 +202,7 @@ lidar_begin_time ←────── lidar scan ──────→ lidar_en
   last_imu_                          must have IMU past here
 ```
 
-同步逻辑：
+同步逻辑（`LaserMapping::SyncPackages`）：
 
 ```cpp
 bool SyncPackages() {
@@ -148,13 +215,21 @@ bool SyncPackages() {
     double last_pt_time = measures_.scan_->points.back().time / 1000.0;
     lidar_end_time_ = measures_.lidar_begin_time_ + last_pt_time;
 
-    // 3. 检查 IMU 是否覆盖整个点云时间段
+    // 3. 异常时间戳保护：超过 5 倍平均扫描时间 → 用均值代替
+    if ((lidar_end_time_ - measures_.lidar_begin_time_) > 5 * lo::lidar_time_interval) {
+        lidar_end_time_ = measures_.lidar_begin_time_ + lo::lidar_time_interval;
+    }
+
+    // 4. 更新运行时扫描时间间隔（Phase 3: 传给 LidarPipeline）
+    lo::lidar_time_interval = lidar_mean_scantime_;
+    lidar_pipeline_->SetLidarTimeInterval(lidar_mean_scantime_);
+
+    // 5. 检查 IMU 是否覆盖整个点云时间段
     if (last_timestamp_imu_ < lidar_end_time_) return false;
 
-    // 4. 收集该时间段内所有 IMU
+    // 6. 收集该时间段内所有 IMU
     measures_.imu_.clear();
-    while (!imu_buffer_.empty() &&
-           imu_buffer_.front()->timestamp < lidar_end_time_) {
+    while (!imu_buffer_.empty() && imu_buffer_.front()->timestamp < lidar_end_time_) {
         measures_.imu_.push_back(imu_buffer_.front());
         imu_buffer_.pop_front();
     }
@@ -187,10 +262,21 @@ mean_gyr_ += (imu->angular_velocity - mean_gyr_) / N;
 初始化完成时：
 - **重力向量**：`grav_ = -mean_acc_.normalized() * 9.81`（从加速度均值推估初始姿态）
 - **陀螺零偏**：`bg_ = mean_gyr_`（静止时角速度即为零偏）
+- **加速度计尺度因子**：`acc_scale_factor_` 根据均值范数判断（`0.5~1.5` → `9.81`，`7~12` → `1.0`）
+- **初始化 LidarPipeline 状态**（Phase 2）：`pipeline_->SetAccScaleFactor()` + `pipeline_->ResetUndistortState()`
 
 ---
 
-## 6. 点云去畸变 (`UndistortPcl`)
+## 6. 点云去畸变 (`LidarPipeline::UndistortFrame`)
+
+Phase 2 重构：从 `ImuProcess::UndistortPcl` 迁移至 `LidarPipeline::UndistortFrame`。
+
+**调用链**：
+```
+ImuProcess::Process()
+  └─ if (pipeline_)  pipeline_->UndistortFrame(meas, kf_state, scan, Q_)
+     else            UndistortPcl(meas, kf_state, scan)  // fallback
+```
 
 **问题**：点云采集期间（约 100ms）传感器在运动，不同时刻的点处于不同位置，需补偿到**扫描结束时刻**。
 
@@ -203,12 +289,13 @@ for (auto it = v_imu.begin(); it < v_imu.end() - 1; it++) {
     double dt = tail->timestamp - head->timestamp;
     Vec3d angvel_avr = 0.5 * (head->angular_velocity + tail->angular_velocity);
     Vec3d acc_avr = 0.5 * (head->linear_acceleration + tail->linear_acceleration);
+    acc_avr = acc_avr * acc_scale_factor_;  // 尺度修正
 
-    kf_state.Predict(dt, Q_, angvel_avr, acc_avr);  // ESKF 预测
+    kf_state.Predict(dt, Q, gyro, acc);  // ESKF 预测
 
     // 保存该时刻的位姿（供后续插值）
     imu_pose_.emplace_back(Pose6D{
-        dt, acc_avr, angvel_avr,
+        dt, acc_s_last_, angvel_last_,
         imu_state.vel_, imu_state.pos_, imu_state.rot_.matrix()
     });
 }
@@ -220,13 +307,13 @@ for (auto it = v_imu.begin(); it < v_imu.end() - 1; it++) {
 
 ```
 R_i = R_head · exp(ω_avg · dt_point)          // 点时刻的旋转
-T_i = pos_head + vel_head · dt + 0.5·a·dt²    // 点时刻的位置偏移
+T_ei = pos_head + vel_head · dt + 0.5·a·dt² - pos_end  // 点时刻的位置偏移
 
-p_compensate = R_end⁻¹ · (R_i · (R_LI · p_lidar + t_LI) + T_i - pos_end) - t_LI
+p_compensate = R_LI⁻¹ · (R_end⁻¹ · (R_i · (R_LI · p_lidar + t_LI) + T_ei) - t_LI)
               (补偿到扫描结束时刻的 LiDAR 坐标系)
 ```
 
-其中 `R_LI`, `t_LI` 为 LiDAR-IMU 外参（默认为单位阵/零）。
+其中 `R_LI`, `t_LI` 为 LiDAR-IMU 外参（默认为单位阵/零）。`dt` 通过 `lidar_time_interval_`（Phase 3: 运行时由 LaserMapping 估算并注入）保护防止异常值。
 
 去畸变结果保存为 `scan_undistort_`（坐标仍在 LiDAR/Body 系）。
 
@@ -244,7 +331,7 @@ x = [pos(3), rot(3), vel(3), bg(3)]
 
 ### 预测步
 
-在 `UndistortPcl` 内部的 `kf_state.Predict()` 中完成：
+在 `LidarPipeline::UndistortFrame` 内部的 `kf_state.Predict()` 中完成：
 
 ```cpp
 // 运动方程（连续时间）：
@@ -260,12 +347,12 @@ P = F · P · F^T + (dt · f_w) · Q · (dt · f_w)^T
 
 ### 更新步（`ESKF::Update`）
 
-调用 `ObsModel`（见第 8 节）构建观测矩阵后，迭代执行 IEKF（Iterated EKF）：
+调用 `ObsModel`（见第 8 节，Phase 2 后委托给 `LidarPipeline::BuildObservation`）构建观测矩阵后，迭代执行 IEKF（Iterated EKF）：
 
 ```cpp
 for (int i = 0; i < maximum_iter_; i++) {
     // 1. 调用观测函数，计算 H^T H 和 H^T r
-    lidar_obs_func_(x_, obs_model);
+    lidar_obs_func_(x_, obs_model);  // → LidarPipeline::BuildObservation
 
     // 2. 特征值分解，检测退化方向（如走廊）
     Eigen::SelfAdjointEigenSolver<Mat6d> es(HTH_sym);
@@ -285,22 +372,26 @@ for (int i = 0; i < maximum_iter_; i++) {
 P_ = (I - K·H) · P
 ```
 
+Phase 3: `maximum_iter_` (`num_max_iterations_`) 和 `esti_plane_threshold_` 不再是全局 `extern` 变量，而是从 YAML 读取后传入 ESKF 和 LidarPipeline。
+
 ---
 
-## 8. 观测模型（点面 ICP）
+## 8. 观测模型（`LidarPipeline::BuildObservation`）
 
-**`ObsModel`** 在每次 ESKF 迭代时被调用，构建点面 ICP 的 H 矩阵和残差。
+Phase 2 重构：从 `LaserMapping::ObsModel` 迁移至 `LidarPipeline::BuildObservation`。
+
+调用链：`ESKF::Update` → `lidar_obs_func_` → `LaserMapping::ObsModel` → `LidarPipeline::BuildObservation`
 
 ### 8.1 流程
 
 ```
 scan_down_body_ (Body 系)
     │
-    ↓ PointBodyToWorld：p_world = R · (R_LI · p + t_LI) + t
+    ↓ 并行转换：p_world = R · (R_LI · p + t_LI) + t
     │
 scan_down_world_ (World 系)
     │
-    ↓ IVox::GetClosestPoint()：KNN 搜索 5 个最近点
+    ↓ LocalMap::GetClosestPoint()：KNN 搜索 5 个最近点
     │
     ↓ math::esti_plane()：SVD 拟合平面 n^T · x + d = 0
     │
@@ -316,26 +407,57 @@ scan_down_world_ (World 系)
 对位姿 `[t, R]` 求导，点面 ICP 的 1×6 雅可比为：
 
 ```
-J = [n^T,  (-R^T · n)^T × p_body]
+J = [n^T,  (point_crossmat · R^T · n)^T]
      ↑ 对平移         ↑ 对旋转（反对称矩阵）
 ```
 
 ### 8.3 汇总信息矩阵
 
-并行遍历所有有效点：
+并行遍历所有有效点（`std::execution::par_unseq`）：
 
 ```cpp
-obs.HTH_ += J^T · J;   // 6×6 Fisher 信息矩阵（累加）
-obs.HTr_ += J^T · r;   // 6×1 信息向量（累加）
+obs.HTH_ += J^T · J · plane_icp_weight_;   // 6×6 Fisher 信息矩阵（累加）
+obs.HTr_ += J^T · r · plane_icp_weight_;   // 6×1 信息向量（累加）
+```
+
+### 8.4 点点 ICP 补充（可选，`enable_icp_part_`）
+
+当 `enable_icp_part_ = true` 时，额外添加 3D 点点 ICP 项：
+
+```cpp
+// 3×6 雅可比
+J.block<3,3>(0,0) = I;
+J.block<3,3>(0,3) = -(R · R_LI) · hat(q);
+
+// 残差
+e = q_world - nearest_point[0];
+
+obs.HTH_ += J^T · J · icp_weight_;
+obs.HTr_ += -J^T · e · icp_weight_;
 ```
 
 有效点数 < 20 时，`obs.valid_ = false`，跳过本次更新。
 
 ---
 
-## 9. IVox 局部地图
+## 9. LocalMap 与 IVox 局部地图
 
-### 数据结构
+### LocalMap（Phase 1: 线程安全包装）
+
+```cpp
+class LocalMap {
+    // 写操作 → unique_lock
+    void AddPoints(const PointVector& pts);
+    // 读操作 → shared_lock
+    bool GetClosestPoint(const PointType& pt, PointVector& neighbors, ...) const;
+    size_t NumValidGrids() const;
+
+    mutable std::shared_mutex rw_mutex_;
+    std::shared_ptr<IVoxType> ivox_;
+};
+```
+
+### IVox 数据结构
 
 ```cpp
 IVox<3, IVoxNodeType::DEFAULT, PointType>
@@ -372,15 +494,17 @@ bool GetClosestPoint(const PointType& pt, PointVector& closest_pt, int max_num =
 | 18 | NEARBY18 | 19 |
 | 26 | NEARBY26 | 27 |
 
-### 地图更新（`MapIncremental`）
+### 地图更新（`LidarPipeline::UpdateMap`）
 
-每创建一个关键帧时调用，将 `scan_down_world_` 中的点添加到 IVox：
+Phase 2 重构：从 `LaserMapping::MapIncremental` 迁移至 `LidarPipeline::UpdateMap`。
 
-```cpp
-ivox_->AddPoints(scan_down_world_->points);
-```
+调用链：`LaserMapping::MapIncremental` → `lidar_pipeline_->UpdateMap(...)`
 
-若体素已存在则追加，否则新建体素，同时维护 LRU 缓存。
+对 `scan_down_body_` 中每个点：
+1. 转换到世界坐标系
+2. 计算体素中心，与最近邻比较决定是否需要添加
+3. 按 `PointAction` 分类：`Add`（需降采样添加）、`NoNeedDownsample`（直接添加）
+4. 批量写入 `LocalMap::AddPoints()`
 
 ---
 
@@ -394,6 +518,9 @@ double rot   = (last_kf_pose.so3().inverse() * cur_pose.so3()).log().norm();
 
 if (trans > kf_dis_th_    // 默认 2.0 m
  || rot   > kf_angle_th_) // 默认 15°（rad）
+    MakeKF();
+// 定位模式下，超过 2 秒也会强制建帧
+if (!is_in_slam_mode_ && (cur_time - last_kf_time) > 2.0)
     MakeKF();
 ```
 
@@ -410,10 +537,11 @@ struct Keyframe {
 ```
 
 关键帧创建后依次触发：
-1. `MapIncremental()` → 更新 IVox
-2. `lc_->AddKF(kf)` → 送回环检测
-3. `g2p5_->PushKeyframe(kf)` → 更新 2D 栅格地图
-4. `ui_->UpdateKF(kf)` → 更新可视化
+1. `MapIncremental()` → `LidarPipeline::UpdateMap()` → 更新 LocalMap/IVox
+2. `SlamEngine::HandleNewKeyframe()`:
+   - `lc_->AddKF(kf)` → 送回环检测
+   - `g2p5_->PushKeyframe(kf)` → 更新 2D 栅格地图
+   - `ui_->UpdateKF(kf)` → 更新可视化
 
 ---
 
@@ -456,50 +584,86 @@ NDT 分数 > `ndt_score_th_`（默认 1.0）的候选进入图优化。
 - **顶点**：所有关键帧的 SE3 位姿
 - **运动边**：相邻关键帧的 LIO 相对位姿（高权重）
 - **回环边**：NDT 配准的相对位姿（低权重）
+- **RTK 先验边**（Phase 4）：`EdgePositionPrior` — 3D 位置先验约束
 
 优化后更新所有关键帧的 `opt_pose_`。
 
 ---
 
-## 12. 完整调用链（时序）
+## 12. RTK/GNSS 融合（Phase 4）
+
+### GnssRtkHandler — 四层假固检测
+
+```cpp
+class GnssRtkHandler {
+    // 四层过滤：
+    // 1. SolutionType 检查：只接受 FIX 和 FLOAT
+    // 2. 精度检查：pos_std_enu 各轴 < 阈值
+    // 3. HDOP / 卫星数检查
+    // 4. 卡方一致性检查（与 PGO 已有约束对比）
+    bool Accept(const GnssRtkFrame& obs);
+};
+```
+
+### PGO 集成
+
+- `PGOImpl` 内维护 RTK 观测队列
+- `AddRtkFactors()`: 为每个有效 RTK 观测添加 `EdgePositionPrior`（3×6 Jacobian）
+- `UpdateRtkChi2()`: 更新卡方统计量用于假固检测
+- `enu_to_map_`: ENU → Map 坐标变换（从首个 FIX 解算）
+- `AssignRtkObsIfNeeded()`: 将 RTK 观测分配到最近的关键帧
+
+---
+
+## 13. 完整调用链（时序）
 
 ```
 ROS2 Subscription / RosbagIO
   │
   ├─ IMU 消息
-  │    └─ SlamSystem::ProcessIMU()
-  │         └─ LaserMapping::ProcessIMU()
-  │              └─ imu_buffer_.push_back()
+  │    └─ SlamEngine::FeedImu(ImuFrame)
+  │         └─ LaserMapping::ProcessIMU(IMUPtr)
+  │              ├─ imu_buffer_.push_back()
+  │              └─ kf_imu_.Predict()  [在线模式：高频外推 100Hz]
   │
   └─ PointCloud2 消息
-       └─ SlamSystem::ProcessLidar()
-            ├─ LaserMapping::ProcessPointCloud2()
+       └─ SlamEngine::FeedLidar(PointCloudFrame)
+            ├─ PointCloudFrame → CloudPtr 转换
+            ├─ LaserMapping::ProcessPointCloud2(cloud)
             │    ├─ PointCloudPreprocess::Process()     [格式统一 + 滤波 + 降采样]
             │    └─ lidar_buffer_.push_back()
             │
             └─ LaserMapping::Run()
                  ├─ SyncPackages()                      [IMU + 点云时间对齐]
+                 │    └─ lo::lidar_time_interval 更新
+                 │    └─ lidar_pipeline_->SetLidarTimeInterval()
+                 │
                  ├─ ImuProcess::Process()
-                 │    ├─ IMUInit() (前 N 帧)            [估计重力 + 陀螺零偏]
-                 │    └─ UndistortPcl()                 [前向积分 → 反向补偿去畸变]
-                 │         └─ ESKF::Predict() × N      [每个 IMU 间隔预测一次]
+                 │    ├─ IMUInit() (前 20 帧)            [估计重力 + 陀螺零偏 + acc scale]
+                 │    │    └─ pipeline_->ResetUndistortState()
+                 │    └─ LidarPipeline::UndistortFrame() [前向积分 → 反向补偿去畸变]
+                 │         └─ ESKF::Predict() × N       [每个 IMU 间隔预测一次]
                  │
                  ├─ VoxelGrid 降采样                    [scan_undistort_ → scan_down_body_]
                  │
                  ├─ ESKF::Update(LIDAR)
                  │    └─ 迭代调用 ObsModel()
-                 │         ├─ PointBodyToWorld()        [投影到世界系]
-                 │         ├─ IVox::GetClosestPoint()   [KNN 搜索]
-                 │         ├─ math::esti_plane()        [SVD 平面拟合]
-                 │         ├─ 计算点面距离残差 r
-                 │         └─ 累加 H^T H, H^T r
+                 │         └─ LidarPipeline::BuildObservation()
+                 │              ├─ 并行 Body→World 投影
+                 │              ├─ LocalMap::GetClosestPoint()   [KNN 搜索]
+                 │              ├─ math::esti_plane()            [SVD 平面拟合]
+                 │              ├─ 计算点面距离残差 r
+                 │              ├─ 累加 H^T H, H^T r (点面 ICP)
+                 │              └─ [可选] 累加点点 ICP 项
                  │    └─ 卡尔曼增益 → 状态更新 → 协方差更新
                  │
                  ├─ 关键帧判断（位移/旋转阈值）
                  │    └─ MakeKF()
-                 │         └─ IVox::AddPoints()         [更新局部地图]
+                 │         └─ LidarPipeline::UpdateMap()   [更新 LocalMap/IVox]
                  │
-                 └─ 分发关键帧
+                 ├─ kf_imu_ 前推到最新 IMU 时刻
+                 │
+                 └─ SlamEngine::HandleNewKeyframe()
                       ├─ LoopClosing::AddKF()          [回环候选 + NDT 配准 + 图优化]
                       ├─ G2P5::PushKeyframe()          [2D 栅格地图更新]
                       └─ PangolinWindow::UpdateKF()    [3D 可视化更新]
@@ -507,17 +671,39 @@ ROS2 Subscription / RosbagIO
 
 ---
 
-## 13. 关键数据类型汇总
+## 14. 关键数据类型汇总
 
-| 变量名 | 类型 | 含义 |
-|--------|------|------|
-| `scan_` | `CloudPtr (PointXYZIT)` | 预处理后原始点云（Body 系） |
-| `scan_undistort_` | `CloudPtr` | 去畸变后点云（Body 系，所有点补偿到扫描结束时刻） |
-| `scan_down_body_` | `CloudPtr` | 体素降采样后点云（Body 系，用于配准） |
-| `scan_down_world_` | `CloudPtr` | 投影到 World 系的降采样点云 |
-| `measures_` | `MeasureGroup` | 一帧点云 + 对应 IMU 序列 |
-| `state_point_` | `NavState` | ESKF 输出的当前状态（pos, rot, vel, bg） |
-| `kf_` | `ESKF` | 点云帧时刻的 ESKF（主估计器） |
-| `kf_imu_` | `ESKF` | IMU 最新时刻的 ESKF（高频外推用） |
-| `ivox_` | `IVox<3>` | 局部点云地图（哈希体素 + LRU） |
-| `all_keyframes_` | `vector<Keyframe::Ptr>` | 全局关键帧列表（前端位姿 + 点云） |
+| 变量名 | 类型 | 含义 | 所属 |
+|--------|------|------|------|
+| `scan_` | `CloudPtr (PointXYZIT)` | 预处理后原始点云（Body 系） | MeasureGroup |
+| `scan_undistort_` | `CloudPtr` | 去畸变后点云（Body 系，所有点补偿到扫描结束时刻） | LaserMapping |
+| `scan_down_body_` | `CloudPtr` | 体素降采样后点云（Body 系，用于配准） | LaserMapping |
+| `scan_down_world_` | `CloudPtr` | 投影到 World 系的降采样点云 | LaserMapping |
+| `measures_` | `MeasureGroup` | 一帧点云 + 对应 IMU 序列 | LaserMapping |
+| `state_point_` | `NavState` | ESKF 输出的当前状态（pos, rot, vel, bg） | LaserMapping |
+| `kf_` | `ESKF` | 点云帧时刻的 ESKF（主估计器） | LaserMapping |
+| `kf_imu_` | `ESKF` | IMU 最新时刻的 ESKF（高频外推用） | LaserMapping |
+| `local_map_` | `shared_ptr<LocalMap>` | 线程安全 IVox 包装（Phase 1） | LaserMapping |
+| `lidar_pipeline_` | `shared_ptr<LidarPipeline>` | 去畸变/观测/地图更新管线（Phase 2） | LaserMapping |
+| `all_keyframes_` | `vector<Keyframe::Ptr>` | 全局关键帧列表（前端位姿 + 点云） | LaserMapping |
+
+### 平台无关类型（`core/types/platform_types.h`）
+
+| 类型 | 字段 | 用途 |
+|------|------|------|
+| `ImuFrame` | `timestamp_sec`, `acc`, `gyro` | Engine FeedImu 输入 |
+| `PointCloudFrame` | `timestamp_sec`, `seq`, `points[]` | Engine FeedLidar 输入 |
+| `RawPoint` | `x, y, z, intensity, time_offset_sec` | PointCloudFrame 内的点 |
+| `GnssRtkFrame` | `timestamp_sec`, `solution_type`, `lat/lon/alt`, `pos_std_enu` | Engine FeedRtk 输入 |
+
+---
+
+## 15. Phase 重构变更摘要
+
+| Phase | 变更 | 涉及文件 |
+|-------|------|---------|
+| Phase 1 | LocalMap 线程安全包装 | `core/lidar/local_map.{h,cc}` |
+| Phase 2 | LidarPipeline 提取 | `core/lidar/lidar_pipeline.{h,cc}` |
+| Phase 3 | 消除 extern 全局变量 | `common/options.h`, `LaserMapping`, `LidarPipeline` |
+| Phase 4 | RTK/GNSS 集成 | `core/gnss/gnss_rtk_handler.{h,cc}`, `pgo_impl.{h,cc}`, `edge_position_prior.h` |
+| Phase 5 | Engine API + 平台无关验证 | `core/engine/slam_engine.{h,cc}`, `loc_engine.{h,cc}`, `adapter/ros2/ros2_converter.{h,cc}`, `core/types/platform_types.h` |
