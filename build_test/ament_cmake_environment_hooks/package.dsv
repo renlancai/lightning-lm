@@ -1,4 +1,0 @@
-source;share/lightning/local_setup.bash
-source;share/lightning/local_setup.dsv
-source;share/lightning/local_setup.sh
-source;share/lightning/local_setup.zsh

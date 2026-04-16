@@ -1,1 +1,0 @@
-/usr/bin/c++ CMakeFiles/test_coordinate_utils.dir/coordinate_utils_test.cc.o CMakeFiles/test_coordinate_utils.dir/root/slam_ws/src/lightning-lm/src/adapter/common/coordinate_utils.cc.o -o test_coordinate_utils  -lglog -lgflags /usr/lib/x86_64-linux-gnu/libgtest_main.a /usr/lib/x86_64-linux-gnu/libgtest.a 

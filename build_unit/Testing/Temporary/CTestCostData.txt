@@ -1,2 +1,0 @@
-CoordinateUtils 1 0.00118156
----
