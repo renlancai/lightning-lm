@@ -64,6 +64,9 @@ class SlamSystem {
     /// 保存地图，默认保存至./data/地图名/ 下方
     void SaveMap(const std::string& path = "");
 
+    /// 获取所有关键帧（用于轨迹输出 / 回归测试）
+    std::vector<Keyframe::Ptr> GetAllKeyframes() const;
+
     /// 处理IMU
     void ProcessIMU(const lightning::IMUPtr& imu);
 

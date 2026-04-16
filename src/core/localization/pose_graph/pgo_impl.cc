@@ -2,6 +2,7 @@
 #include "core/opti_algo/algo_select.h"
 #include "core/robust_kernel/robust_kernel_all.h"
 #include "core/lightning_math.hpp"
+#include "core/types/edge_position_prior.h"
 
 #include <boost/format.hpp>
 #include <cassert>
@@ -99,6 +100,9 @@ void PGOImpl::AddPGOFrame(std::shared_ptr<PGOFrame> pgo_frame) {
         LOG(ERROR) << "PGO received pgo frame, but assign relative pose failed!";
         return;
     }
+
+    // 尝试从 RTK 队列中为当前帧匹配 RTK 观测
+    AssignRtkObsIfNeeded(pgo_frame);
 
     is_in_map_ = pgo_frame->lidar_loc_set_ && pgo_frame->lidar_loc_valid_;
     if (!is_in_map_) {
@@ -275,6 +279,7 @@ void PGOImpl::BuildProblem() {
     }
 
     AddLidarOdomFactors();
+    AddRtkFactors();
     AddPriorFactors();
 }
 
@@ -285,6 +290,7 @@ void PGOImpl::CleanProblem() {
     lidar_odom_edges_.clear();
     dr_edges_.clear();
     prior_edges_.clear();
+    rtk_edges_.clear();
 }
 
 void PGOImpl::AddVertex() {
@@ -447,6 +453,89 @@ void PGOImpl::AddDRFactors() {
         optimizer_->AddEdge(e);
         dr_edges_.emplace_back(e);
     }
+}
+
+void PGOImpl::AddRtkFactors() {
+    for (auto& frame : frames_) {
+        if (!frame->rtk_obs.set || !frame->rtk_obs.valid || !frame->rtk_obs.inlier) {
+            continue;
+        }
+
+        auto v = optimizer_->GetVertex(frame->frame_id_);
+        if (v == nullptr) continue;
+
+        // Convert ENU position to map frame
+        Vec3d pos_map = enu_to_map_.so3() * frame->rtk_obs.pos_enu + enu_to_map_.translation();
+
+        // Build 3×3 information matrix from position covariance
+        Mat3d pos_cov_map = enu_to_map_.so3().matrix() * frame->rtk_obs.pos_cov *
+                            enu_to_map_.so3().matrix().transpose();
+        Mat3d info = pos_cov_map.inverse();
+
+        auto e = std::make_shared<miao::EdgePositionPrior>();
+        e->SetVertex(0, v);
+        e->SetMeasurement(pos_map);
+        e->SetInformation(info);
+
+        auto rk = std::make_shared<miao::RobustKernelHuber>();
+        rk->SetDelta(options_.rtk_chi2_reject_th);
+        e->SetRobustKernel(rk);
+
+        optimizer_->AddEdge(e);
+        rtk_edges_.emplace_back(e);
+    }
+}
+
+void PGOImpl::UpdateRtkChi2() {
+    // Identify frames that have RTK set (same order as rtk_edges_)
+    std::vector<std::shared_ptr<PGOFrame>> frames_with_rtk;
+    for (auto& frame : frames_) {
+        if (frame->rtk_obs.set && frame->rtk_obs.valid && frame->rtk_obs.inlier) {
+            frames_with_rtk.push_back(frame);
+        }
+    }
+
+    const size_t n = std::min(rtk_edges_.size(), frames_with_rtk.size());
+    for (size_t i = 0; i < n; ++i) {
+        rtk_edges_[i]->ComputeError();
+        const double chi2 = rtk_edges_[i]->Chi2();
+        frames_with_rtk[i]->rtk_obs.chi2 = chi2;
+        if (chi2 > options_.rtk_chi2_reject_th) {
+            frames_with_rtk[i]->rtk_obs.inlier = false;
+            LOG(WARNING) << "RTK L4: chi2=" << chi2 << " > " << options_.rtk_chi2_reject_th
+                         << ", frame " << frames_with_rtk[i]->frame_id_ << " marked as outlier";
+        }
+    }
+}
+
+void PGOImpl::AssignRtkObsIfNeeded(std::shared_ptr<PGOFrame> frame) {
+    if (rtk_queue_.empty()) return;
+
+    // Find RTK obs closest in time to the frame
+    double best_dt = std::numeric_limits<double>::max();
+    core::GnssRtkHandler::RtkObservation best_obs;
+    for (auto& obs : rtk_queue_) {
+        double dt = std::fabs(obs.timestamp_sec - frame->timestamp_);
+        if (dt < best_dt) {
+            best_dt = dt;
+            best_obs = obs;
+        }
+    }
+
+    // Only assign if close enough in time
+    constexpr double kMaxRtkPgoTimeDiff = 0.5;
+    if (best_dt > kMaxRtkPgoTimeDiff) return;
+
+    frame->rtk_obs.set            = true;
+    frame->rtk_obs.valid          = best_obs.valid && best_obs.inlier;
+    frame->rtk_obs.inlier         = best_obs.inlier;
+    frame->rtk_obs.pos_enu        = best_obs.pos_enu;
+    frame->rtk_obs.pos_cov        = best_obs.pos_cov;
+    frame->rtk_obs.heading_valid  = best_obs.heading_valid;
+    frame->rtk_obs.heading_rad    = best_obs.heading_rad;
+    frame->rtk_obs.heading_cov    = best_obs.heading_cov;
+    frame->rtk_obs.solution_type  = best_obs.solution_type;
+    frame->rtk_obs.timestamp_sec  = best_obs.timestamp_sec;
 }
 
 void PGOImpl::AddPriorFactors() {

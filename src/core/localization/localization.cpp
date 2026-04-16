@@ -96,7 +96,7 @@ bool Localization::Init(const std::string& yaml_path, const std::string& global_
         loc_result_ = res;
 
         if (tf_callback_ && loc_result_.valid_) {
-            tf_callback_(loc_result_.ToGeoMsg());
+            tf_callback_(loc_result_.pose_, loc_result_.timestamp_);
         }
 
         if (ui_) {
@@ -242,11 +242,8 @@ void Localization::LidarLocProcCloud(CloudPtr scan_undist) {
         ui_->UpdateScan(scan_undist, res.pose_);
     }
 
-    if (loc_state_callback_) {
-        auto loc_state = std::make_shared<std_msgs::msg::Int32>();
-        loc_state->data = static_cast<int>(res.status_);
-        LOG(INFO) << "loc_state: " << loc_state->data;
-        loc_state_callback_(*loc_state);
+    if (false) {  // loc_state_callback_ removed (was std_msgs::Int32, now unused)
+        LOG(INFO) << "loc_state: " << static_cast<int>(res.status_);
     }
 
     // cv::Mat img(100, 100, CV_8UC3, cv::Scalar(255, 255, 255));
@@ -347,5 +344,25 @@ void Localization::SetExternalPose(const Eigen::Quaterniond& q, const Eigen::Vec
 }
 
 void Localization::SetTFCallback(Localization::TFCallback&& callback) { tf_callback_ = callback; }
+
+// ── Phase 5: platform-agnostic feed methods ───────────────────────────────────
+
+void Localization::ProcessCloud(CloudPtr cloud) {
+    UL lock(global_mutex_);
+    if (lidar_loc_ == nullptr || lio_ == nullptr || pgo_ == nullptr) {
+        return;
+    }
+    if (options_.online_mode_) {
+        lidar_odom_proc_cloud_.AddMessage(cloud);
+    } else {
+        LidarOdomProcCloud(cloud);
+    }
+}
+
+void Localization::ProcessRtk(const core::GnssRtkHandler::RtkObservation& obs) {
+    if (pgo_) {
+        pgo_->ProcessRtk(obs);
+    }
+}
 
 }  // namespace lightning::loc

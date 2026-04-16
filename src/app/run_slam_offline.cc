@@ -5,6 +5,9 @@
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 
+#include <fstream>
+#include <iomanip>
+
 #include "core/system/slam.h"
 #include "ui/pangolin_window.h"
 #include "utils/timer.h"
@@ -15,6 +18,7 @@
 
 DEFINE_string(input_bag, "", "输入数据包");
 DEFINE_string(config, "./config/default.yaml", "配置文件");
+DEFINE_string(output_traj, "", "输出轨迹文件（TUM格式，空则不输出）");
 
 /// 运行一个LIO前端，带可视化
 int main(int argc, char** argv) {
@@ -73,6 +77,28 @@ int main(int argc, char** argv) {
         .Go();
 
     slam.SaveMap("");
+
+    // ── 输出 TUM 格式轨迹 ──────────────────────────────────────────────
+    if (!FLAGS_output_traj.empty()) {
+        std::ofstream traj_file(FLAGS_output_traj);
+        if (traj_file) {
+            traj_file << std::fixed << std::setprecision(9);
+            for (const auto& kf : slam.GetAllKeyframes()) {
+                const auto& state = kf->GetState();
+                const SE3 pose = kf->GetOptPose();
+                const auto& t = pose.translation();
+                const auto q = pose.unit_quaternion();
+                traj_file << state.timestamp_ << " "
+                          << t.x() << " " << t.y() << " " << t.z() << " "
+                          << q.x() << " " << q.y() << " " << q.z() << " " << q.w()
+                          << "\n";
+            }
+            LOG(INFO) << "Trajectory saved to " << FLAGS_output_traj
+                      << " (" << slam.GetAllKeyframes().size() << " frames)";
+        } else {
+            LOG(ERROR) << "Cannot write trajectory to " << FLAGS_output_traj;
+        }
+    }
     Timer::PrintAll();
 
     LOG(INFO) << "done";

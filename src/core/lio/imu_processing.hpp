@@ -14,6 +14,7 @@
 #include "common/eigen_types.h"
 #include "common/measure_group.h"
 #include "common/point_def.h"
+#include "core/lidar/lidar_pipeline.h"   // Phase 2: delegate UndistortPcl
 #include "core/lio/eskf.hpp"
 #include "core/lio/imu_filter.h"
 #include "core/lio/pose6d.h"
@@ -39,7 +40,14 @@ class ImuProcess {
     void Process(const MeasureGroup &meas, ESKF &kf_state, CloudPtr &scan);
 
     bool IsIMUInited() const { return imu_need_init_ == false; }
-    void SetUseIMUFilter(bool b) { use_imu_filter_ = b; }
+    void SetUseIMUFilter(bool b) {
+        use_imu_filter_ = b;
+        if (pipeline_) pipeline_->SetUseIMUFilter(b);
+    }
+    void SetLidarPipeline(std::shared_ptr<LidarPipeline> p) {
+        pipeline_ = std::move(p);
+        if (pipeline_) pipeline_->SetUseIMUFilter(use_imu_filter_);
+    }
 
     double GetMeanAccNorm() const { return mean_acc_.norm(); }
 
@@ -77,6 +85,9 @@ class ImuProcess {
 
     bool use_imu_filter_ = true;
     IMUFilter filter_;
+
+    // Phase 2: delegate undistortion to LidarPipeline when set
+    std::shared_ptr<LidarPipeline> pipeline_;
 };
 
 inline ImuProcess::ImuProcess() : b_first_frame_(true), imu_need_init_(true) {
@@ -346,6 +357,12 @@ inline void ImuProcess::Process(const MeasureGroup &meas, ESKF &kf_state, CloudP
             LOG(INFO) << "imu init done, bg: " << imu_state.bg_.transpose() << ", grav: " << imu_state.grav_.transpose()
                       << ", acc scale: " << acc_scale_factor_ << ", mean: " << mean_acc_.transpose() << ", "
                       << mean_gyr_.transpose();
+
+            // Phase 2: seed LidarPipeline undistortion state after init
+            if (pipeline_) {
+                pipeline_->SetAccScaleFactor(acc_scale_factor_);
+                pipeline_->ResetUndistortState(last_imu_);
+            }
         } else {
             LOG(INFO) << "waiting for imu init ... " << init_iter_num_;
         }
@@ -353,7 +370,17 @@ inline void ImuProcess::Process(const MeasureGroup &meas, ESKF &kf_state, CloudP
         return;
     }
 
-    Timer::Evaluate([&, this]() { UndistortPcl(meas, kf_state, scan); }, "Undistort Pcl");
+    // Phase 2: delegate to LidarPipeline if set; otherwise fall back to local impl
+    if (pipeline_) {
+        // Build Q from current covariance vectors (same logic as UndistortPcl)
+        Q_.block<3, 3>(0, 0).diagonal() = cov_gyr_;
+        Q_.block<3, 3>(3, 3).diagonal() = cov_acc_;
+        Q_.block<3, 3>(6, 6).diagonal() = cov_bias_gyr_;
+        Timer::Evaluate([&, this]() { pipeline_->UndistortFrame(meas, kf_state, scan, Q_); },
+                        "Undistort Pcl");
+    } else {
+        Timer::Evaluate([&, this]() { UndistortPcl(meas, kf_state, scan); }, "Undistort Pcl");
+    }
 }
 }  // namespace lightning
 

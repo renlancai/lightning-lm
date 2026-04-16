@@ -59,8 +59,21 @@ bool LocSystem::Init(const std::string &yaml_path) {
 
     if (options_.pub_tf_) {
         tf_broadcaster_ = std::make_shared<tf2_ros::TransformBroadcaster>(node_);
-        loc_->SetTFCallback(
-            [this](const geometry_msgs::msg::TransformStamped &pose) { tf_broadcaster_->sendTransform(pose); });
+        loc_->SetTFCallback([this](const SE3& pose, double ts) {
+            geometry_msgs::msg::TransformStamped msg;
+            msg.header.frame_id  = "map";
+            msg.header.stamp.sec     = static_cast<int32_t>(ts);
+            msg.header.stamp.nanosec = static_cast<uint32_t>((ts - msg.header.stamp.sec) * 1e9);
+            msg.child_frame_id = "base_link";
+            msg.transform.translation.x = pose.translation().x();
+            msg.transform.translation.y = pose.translation().y();
+            msg.transform.translation.z = pose.translation().z();
+            msg.transform.rotation.x = pose.so3().unit_quaternion().x();
+            msg.transform.rotation.y = pose.so3().unit_quaternion().y();
+            msg.transform.rotation.z = pose.so3().unit_quaternion().z();
+            msg.transform.rotation.w = pose.so3().unit_quaternion().w();
+            tf_broadcaster_->sendTransform(msg);
+        });
     }
 
     bool ret = loc_->Init(yaml_path, map_path);

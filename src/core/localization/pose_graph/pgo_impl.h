@@ -17,6 +17,8 @@
 #include "core/localization/localization_result.h"
 #include "core/types/edge_se3.h"
 #include "core/types/edge_se3_prior.h"
+#include "core/types/edge_position_prior.h"
+#include "core/gnss/gnss_rtk_handler.h"
 
 namespace lightning::loc {
 
@@ -36,15 +38,24 @@ struct PGOFrame {
     SE3 last_opti_pose_;  // 上一轮优化位姿，用于判断是否收敛
     int opti_times_ = 0;  // 当前帧被优化的次数
 
-    // GNSS/RTK观测【插值量】 | 提供绝对约束
-    // bool rtk_set_    = false;          // RTK是否已经设置（可以已设置但状态位无效）
-    // bool rtk_valid_  = false;          // RTK在[状态位]角度来看是否有效
-    // bool rtk_inlier_ = true;           // RTK在PGO看来是否为inlier
-    // SE3 rtk_pose_;                     // 插值得到的RTK pose（roll&pitch为零，z为零）
-    // double rtk_delta_t_          = 0;  // 插值时，bestmatch相对于上一帧rtk消息的时延
-    // double rtk_interp_time_error = 0;  // 当前帧在rtk队列上做插值时的时间误差
-    // common::UTMCoordinate rtk_utm_;    // 与PGO帧最接近的原始RTK观测
-    // double rtk_chi2_ = 0.0;            // RTK卡方误差
+    // GNSS/RTK观测 | 提供绝对位置约束
+    struct RtkObs {
+        bool  set    = false;   // RTK观测是否已设置
+        bool  valid  = false;   // 通过了L1-L3过滤
+        bool  inlier = true;    // PGO chi2检验通过（L4）
+
+        Vec3d pos_enu  = Vec3d::Zero();   // ENU位置（相对Datum，米）
+        Mat3d pos_cov  = Mat3d::Identity();  // 位置协方差
+
+        bool   heading_valid = false;
+        double heading_rad   = 0.0;
+        double heading_cov   = 0.0;
+
+        core::GnssRtkFrame::SolutionType solution_type =
+            core::GnssRtkFrame::SolutionType::INVALID;
+        double chi2          = 0.0;
+        double timestamp_sec = 0.0;
+    } rtk_obs;
 
     // 激光定位观测 | 提供绝对约束
     bool lidar_loc_set_ = false;                         // lidarLoc是否已经设置（PGO由lodarLoc触发，正常是有效的）
@@ -116,6 +127,10 @@ struct PGOImpl {
         double pgo_frame_converge_pos_th = 0.05;                      // PGO帧位置收敛阈值
         double pgo_frame_converge_ang_th = 1.0 * constant::kDEG2RAD;  // PGO帧姿态收敛阈值
         double pgo_smooth_factor = 0.01;                              // PGO帧平滑因子
+
+        // RTK/GNSS
+        double rtk_pos_noise   = 0.05;   // RTK FIX位置噪声 (m)
+        double rtk_chi2_reject_th = 7.81; // chi2拒绝阈值 (3-DOF, p=0.05)
     };
 
     PGOImpl(Options options = {});
@@ -129,6 +144,7 @@ struct PGOImpl {
     // bool AssignRelativePoseIfNeeded(std::shared_ptr<PGOFrame> frame);
     bool AssignLidarOdomPoseIfNeeded(std::shared_ptr<PGOFrame> frame);
     bool AssignDRPoseIfNeeded(std::shared_ptr<PGOFrame> frame);
+    void AssignRtkObsIfNeeded(std::shared_ptr<PGOFrame> frame);
 
     void UpdateLidarOdomStatusInFrame(NavState& lio_result, std::shared_ptr<PGOFrame> frame);
 
@@ -151,6 +167,12 @@ struct PGOImpl {
     void AddLidarOdomFactors();
 
     void AddDRFactors();
+
+    // 添加 RTK 位置约束
+    void AddRtkFactors();
+
+    // 优化后回填 RTK chi2（Layer 4）
+    void UpdateRtkChi2();
 
     // 如果滑窗第一帧存在边缘化约束，添加之
     void AddPriorFactors();
@@ -205,6 +227,15 @@ struct PGOImpl {
     std::deque<TimedPose> lidar_loc_pose_queue_;  // LidarLoc观测队列
     std::deque<TimedPose> output_pose_queue_;     // 输出位姿队列
 
+    // RTK 观测队列（GnssRtkHandler 过滤后的有效观测）
+    std::deque<core::GnssRtkHandler::RtkObservation> rtk_queue_;
+
+    // ENU → map 变换（默认 identity，即 ENU 基准与地图原点对齐）
+    // 通过 SetEnuToMap() 从外部注入，用于将 RTK ENU 坐标转为地图系坐标
+    SE3  enu_to_map_ = SE3();
+    bool enu_to_map_set_ = false;
+    void SetEnuToMap(const SE3& T) { enu_to_map_ = T; enu_to_map_set_ = true; }
+
     // internal variables
     double last_gps_time_ = 0;          // 上一个gps时间戳,用于判断重复/回流数据
     FrameId accumulated_frame_id_ = 0;  // 每次自加1，作为新进PGOFrame的Id
@@ -218,6 +249,7 @@ struct PGOImpl {
     std::vector<std::shared_ptr<miao::EdgeSE3>> dr_edges_;              // 相对运动观测（来自DR）
     std::vector<std::shared_ptr<miao::EdgeSE3Prior>> lidar_loc_edges_;  // 激光定位边
     std::vector<std::shared_ptr<miao::EdgeSE3Prior>> prior_edges_;      // 边缘化约束
+    std::vector<std::shared_ptr<miao::EdgePositionPrior>> rtk_edges_;   // RTK位置约束边
 
     // output variables
     LocalizationResult result_;  // pgo融合定位结果

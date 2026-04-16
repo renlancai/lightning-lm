@@ -22,11 +22,23 @@ bool LaserMapping::Init(const std::string &config_yaml) {
     }
 
     // localmap init (after LoadParams)
-    ivox_ = std::make_shared<IVoxType>(ivox_options_);
+    local_map_ = std::make_shared<LocalMap>(ivox_options_);
+
+    // Phase 2: init LidarPipeline
+    LidarPipeline::Options pl_opts;
+    pl_opts.enable_icp_part_       = options_.enable_icp_part_;
+    pl_opts.plane_icp_weight_      = options_.plane_icp_weight_;
+    pl_opts.icp_weight_            = options_.icp_weight_;
+    pl_opts.filter_size_map_min_   = filter_size_map_min_;
+    pl_opts.esti_plane_threshold_  = esti_plane_threshold_;  // Phase 3
+    lidar_pipeline_ = std::make_shared<LidarPipeline>(pl_opts);
+    lidar_pipeline_->SetLocalMap(local_map_);
+    lidar_pipeline_->SetExtrinsic(offset_t_lidar_fixed_, offset_R_lidar_fixed_);
+    p_imu_->SetLidarPipeline(lidar_pipeline_);  // also forwards use_imu_filter
 
     // esekf init
     ESKF::Options eskf_options;
-    eskf_options.max_iterations_ = fasterlio::NUM_MAX_ITERATIONS;
+    eskf_options.max_iterations_ = num_max_iterations_;  // Phase 3
     eskf_options.epsi_ = 1e-3 * Eigen::Matrix<double, ESKF::state_dim_, 1>::Ones();
     eskf_options.lidar_obs_func_ = [this](NavState &s, ESKF::CustomObservationModel &obs) { ObsModel(s, obs); };
     eskf_options.use_aa_ = use_aa_;
@@ -43,8 +55,8 @@ bool LaserMapping::LoadParamsFromYAML(const std::string &yaml_file) {
 
     auto yaml = YAML::LoadFile(yaml_file);
     try {
-        fasterlio::NUM_MAX_ITERATIONS = yaml["fasterlio"]["max_iteration"].as<int>();
-        fasterlio::ESTI_PLANE_THRESHOLD = yaml["fasterlio"]["esti_plane_threshold"].as<float>();
+        num_max_iterations_ = yaml["fasterlio"]["max_iteration"].as<int>();
+        esti_plane_threshold_ = yaml["fasterlio"]["esti_plane_threshold"].as<float>();
 
         filter_size_scan = yaml["fasterlio"]["filter_size_scan"].as<float>();
         filter_size_map_min_ = yaml["fasterlio"]["filter_size_map"].as<float>();
@@ -172,8 +184,31 @@ bool LaserMapping::Run() {
         return false;
     }
 
+#ifdef LIGHTNING_SNAPSHOT_DEBUG
+    debug_obs_first_call_ = true;
+    debug_cp_ = CheckPoint{};
+    debug_cp_.frame_id = frame_num_;
+    if (debug_cb_) {
+        debug_cp_.imu_timestamps.clear();
+        for (const auto& imu : measures_.imu_) {
+            debug_cp_.imu_timestamps.push_back(imu->timestamp);
+        }
+    }
+#endif
+
     /// IMU process, kf prediction, undistortion
     p_imu_->Process(measures_, kf_, scan_undistort_);
+
+#ifdef LIGHTNING_SNAPSHOT_DEBUG
+    if (debug_cb_) {
+        debug_cp_.undistort_pts.clear();
+        const int n = std::min(50, static_cast<int>(scan_undistort_->size()));
+        for (int i = 0; i < n; ++i) {
+            const auto& p = scan_undistort_->points[i];
+            debug_cp_.undistort_pts.push_back({p.x, p.y, p.z});
+        }
+    }
+#endif
 
     if (scan_undistort_->empty() || (scan_undistort_ == nullptr)) {
         LOG(WARNING) << "No point, skip this scan!";
@@ -189,8 +224,7 @@ bool LaserMapping::Run() {
         for (int i = 0; i < scan_undistort_->size(); i++) {
             PointBodyToWorld(scan_undistort_->points[i], scan_down_world_->points[i]);
         }
-        ivox_->AddPoints(scan_down_world_->points);
-
+        local_map_->AddPoints(scan_down_world_->points);
         first_lidar_time_ = measures_.lidar_end_time_;
         state_point_.timestamp_ = lidar_end_time_;
         flg_first_scan_ = false;
@@ -254,11 +288,7 @@ bool LaserMapping::Run() {
     scan_down_world_->resize(cur_pts);
     nearest_points_.resize(cur_pts);
 
-    // 成员变量预分配
-    residuals_.resize(cur_pts, 0);
-    point_selected_surf_.resize(cur_pts, 1);
-    point_selected_icp_.resize(cur_pts, 1);
-    plane_coef_.resize(cur_pts, Vec4f::Zero());
+    // observation buffers are owned by lidar_pipeline_ (Phase 2)
 
     auto pred_state = kf_.GetX();
     // pred_state.pos_ = state_point_.pos_;  // 假定位置不动行不行,防止速度漂移
@@ -269,6 +299,15 @@ bool LaserMapping::Run() {
     state_point_ = kf_.GetX();
     state_point_.timestamp_ = measures_.lidar_end_time_;
 
+#ifdef LIGHTNING_SNAPSHOT_DEBUG
+    if (debug_cb_) {
+        debug_cp_.pos = state_point_.pos_;
+        debug_cp_.vel = state_point_.vel_;
+        debug_cp_.bg  = state_point_.bg_;
+        debug_cp_.rot = state_point_.rot_.unit_quaternion();
+    }
+#endif
+
     const double delta_translation = (pred_state.pos_ - state_point_.pos_).norm();
     const double delta_rotation_deg = (pred_state.rot_.inverse() * state_point_.rot_).log().norm() * 180.0 / M_PI;
     const double delta_velocity = (pred_state.vel_ - state_point_.vel_).norm();
@@ -276,8 +315,8 @@ bool LaserMapping::Run() {
     const double current_speed = state_point_.vel_.norm();
 
     LOG(INFO) << "[ mapping ]: In num: " << scan_undistort_->points.size() << " down " << cur_pts
-              << " Map grid num: " << ivox_->NumValidGrids() << " effect num : " << effect_feat_surf_ << ", "
-              << effect_feat_icp_;
+              << " Map grid num: " << local_map_->NumValidGrids() << " effect num : "
+              << lidar_pipeline_->GetEffectFeatSurf() << ", " << lidar_pipeline_->GetEffectFeatICP();
     LOG(INFO) << "delta trans: " << (pred_state.pos_ - state_point_.pos_).transpose()
               << ", ang: " << delta_rotation_deg;
     // LOG(INFO) << "P diag: " << kf_.GetP().diagonal().transpose();
@@ -326,6 +365,13 @@ bool LaserMapping::Run() {
               << state_point_.rot_.angleZ<double>() * 180 / M_PI << ", vel: " << state_point_.vel_.transpose()
               << ", grav: " << state_point_.grav_.transpose() << ", grav norm: " << state_point_.grav_.norm();
 
+#ifdef LIGHTNING_SNAPSHOT_DEBUG
+    if (debug_cb_) {
+        debug_cb_(debug_cp_);
+    }
+#endif
+    frame_num_++;
+
     return true;
 }
 
@@ -363,6 +409,14 @@ void LaserMapping::ProjectKFs(CloudPtr cloud, int size_limit) {
 
 void LaserMapping::MakeKF() {
     Keyframe::Ptr kf = std::make_shared<Keyframe>(kf_id_++, scan_undistort_, state_point_);
+
+#ifdef LIGHTNING_SNAPSHOT_DEBUG
+    if (debug_cb_) {
+        debug_cp_.is_keyframe = true;
+        debug_cp_.kf_pos = state_point_.pos_;
+        debug_cp_.kf_rot = state_point_.rot_.unit_quaternion();
+    }
+#endif
 
     if (last_kf_) {
         /// opt pose 用之前的递推
@@ -507,6 +561,9 @@ bool LaserMapping::SyncPackages() {
         }
 
         lo::lidar_time_interval = lidar_mean_scantime_;
+        if (lidar_pipeline_) {
+            lidar_pipeline_->SetLidarTimeInterval(lidar_mean_scantime_);
+        }
 
         // LOG(INFO) << "recompute lidar end time: " << std::setprecision(14) << lidar_end_time_;
         measures_.lidar_end_time_ = lidar_end_time_;
@@ -543,260 +600,26 @@ bool LaserMapping::SyncPackages() {
 }
 
 void LaserMapping::MapIncremental() {
-    PointVector points_to_add;
-    PointVector point_no_need_downsample;
-
-    size_t cur_pts = scan_down_body_->size();
-    points_to_add.reserve(cur_pts);
-    point_no_need_downsample.reserve(cur_pts);
-
-    std::vector<size_t> index(cur_pts);
-    for (size_t i = 0; i < cur_pts; ++i) {
-        index[i] = i;
-    }
-
-    std::for_each(index.begin(), index.end(), [&](const size_t &i) {
-        /* transform to world frame */
-        PointBodyToWorld(scan_down_body_->points[i], scan_down_world_->points[i]);
-
-        /* decide if need add to map */
-        PointType &point_world = scan_down_world_->points[i];
-        if (!nearest_points_[i].empty() && flg_EKF_inited_) {
-            const PointVector &points_near = nearest_points_[i];
-
-            Eigen::Vector3f center =
-                ((point_world.getVector3fMap() / filter_size_map_min_).array().floor() + 0.5) * filter_size_map_min_;
-
-            Eigen::Vector3f dis_2_center = points_near[0].getVector3fMap() - center;
-
-            if (fabs(dis_2_center.x()) > 0.5 * filter_size_map_min_ &&
-                fabs(dis_2_center.y()) > 0.5 * filter_size_map_min_ &&
-                fabs(dis_2_center.z()) > 0.5 * filter_size_map_min_) {
-                point_no_need_downsample.emplace_back(point_world);
-                return;
-            }
-
-            bool need_add = true;
-            float dist = math::calc_dist(point_world.getVector3fMap(), center);
-            if (points_near.size() >= fasterlio::NUM_MATCH_POINTS) {
-                for (int readd_i = 0; readd_i < fasterlio::NUM_MATCH_POINTS; readd_i++) {
-                    if (math::calc_dist(points_near[readd_i].getVector3fMap(), center) < dist + 1e-6) {
-                        need_add = false;
-                        break;
-                    }
-                }
-            }
-
-            if (need_add) {
-                points_to_add.emplace_back(point_world);  // FIXME 这并发可能有点问题
-            }
-        } else {
-            points_to_add.emplace_back(point_world);
-        }
-    });
-
-    Timer::Evaluate(
-        [&, this]() {
-            ivox_->AddPoints(points_to_add);
-            ivox_->AddPoints(point_no_need_downsample);
-        },
-        "    IVox Add Points");
+    // Phase 2: delegate to LidarPipeline
+    lidar_pipeline_->UpdateMap(scan_down_body_, scan_down_world_, nearest_points_, state_point_, flg_EKF_inited_);
 }
 
 /**
- * Lidar point cloud registration
- * will be called by the eskf custom observation model
- * compute point-to-plane residual here
- * @param s kf state
- * @param ekfom_data H matrix
+ * Lidar point cloud registration — now delegates to LidarPipeline (Phase 2).
  */
 void LaserMapping::ObsModel(NavState &s, ESKF::CustomObservationModel &obs) {
-    int cnt_pts = scan_down_body_->size();
+    lidar_pipeline_->BuildObservation(scan_down_body_, scan_down_world_,
+                                      nearest_points_, s, obs);
 
-    std::vector<size_t> index(cnt_pts);
-    for (size_t i = 0; i < index.size(); ++i) {
-        index[i] = i;
+#ifdef LIGHTNING_SNAPSHOT_DEBUG
+    // CP-3: capture HTH/HTr on the first ObsModel call per frame
+    if (debug_cb_ && debug_obs_first_call_) {
+        debug_obs_first_call_ = false;
+        debug_cp_.HTH       = obs.HTH_;
+        debug_cp_.HTr       = obs.HTr_;
+        debug_cp_.valid_num = lidar_pipeline_->GetEffectFeatSurf();
     }
-
-    // LOG(INFO) << "obs from state: " << s.pos_.transpose() << ", " << s.rot_.unit_quaternion().coeffs().transpose();
-
-    Timer::Evaluate(
-        [&, this]() {
-            Mat3f R_wl = (s.rot_.matrix() * offset_R_lidar_fixed_).cast<float>();
-            Vec3f t_wl = (s.rot_ * offset_t_lidar_fixed_ + s.pos_).cast<float>();
-
-            std::for_each(std::execution::par_unseq, index.begin(), index.end(), [&](const size_t &i) {
-                PointType &point_body = scan_down_body_->points[i];
-                PointType &point_world = scan_down_world_->points[i];
-
-                /* transform to world frame */
-                Vec3f p_body = point_body.getVector3fMap();
-                point_world.getVector3fMap() = R_wl * p_body + t_wl;
-                point_world.intensity = point_body.intensity;
-
-                auto &points_near = nearest_points_[i];
-                points_near.clear();
-
-                /** Find the closest surfaces in the map **/
-                ivox_->GetClosestPoint(point_world, points_near, fasterlio::NUM_MATCH_POINTS);
-                point_selected_surf_[i] = points_near.size() >= fasterlio::MIN_NUM_MATCH_POINTS;
-
-                point_selected_icp_[i] = point_selected_surf_[i];
-
-                /// 能找到3个点以上，则估计平面
-                if (point_selected_surf_[i]) {
-                    point_selected_surf_[i] =
-                        math::esti_plane(plane_coef_[i], points_near, fasterlio::ESTI_PLANE_THRESHOLD);
-                }
-
-                /// 计算平面阈值
-                if (point_selected_surf_[i]) {
-                    auto temp = point_world.getVector4fMap();
-                    temp[3] = 1.0;
-                    float pd2 = plane_coef_[i].dot(temp);
-
-                    if (p_body.norm() > 81 * pd2 * pd2) {
-                        point_selected_surf_[i] = true;
-                        residuals_[i] = pd2;
-                    } else {
-                        point_selected_surf_[i] = false;
-                    }
-                }
-            });
-        },
-        "    ObsModel (Lidar Match)");
-
-    effect_feat_surf_ = 0;
-    effect_feat_icp_ = 0;
-
-    corr_pts_.resize(cnt_pts);
-    corr_norm_.resize(cnt_pts);
-    for (int i = 0; i < cnt_pts; i++) {
-        if (point_selected_surf_[i]) {
-            corr_norm_[effect_feat_surf_] = plane_coef_[i];
-            corr_pts_[effect_feat_surf_] = scan_down_body_->points[i].getVector4fMap();
-            corr_pts_[effect_feat_surf_][3] = residuals_[i];
-
-            effect_feat_surf_++;
-        }
-
-        if (point_selected_icp_[i]) {
-            effect_feat_icp_++;
-        }
-    }
-
-    corr_pts_.resize(effect_feat_surf_);
-    corr_norm_.resize(effect_feat_surf_);
-
-    if (effect_feat_surf_ < 20) {
-        obs.valid_ = false;
-        LOG(WARNING) << "No enough effective surface points: " << effect_feat_surf_ << ", icp: " << effect_feat_icp_
-                     << ", required: " << 20;
-        return;
-    }
-
-    index.resize(effect_feat_surf_);
-    const Mat3f off_R = offset_R_lidar_fixed_.cast<float>();
-    const Vec3f off_t = offset_t_lidar_fixed_.cast<float>();
-    const Mat3f Rt = s.rot_.matrix().transpose().cast<float>();
-
-    /// 点面ICP部分
-    obs.HTH_.setZero();
-    obs.HTr_.setZero();
-
-    std::vector<Mat6d> JTJ(effect_feat_surf_);
-    std::vector<Vec6d> JTr(effect_feat_surf_);
-
-    std::vector<double> res_sq(index.size());
-
-    std::for_each(std::execution::par_unseq, index.begin(), index.end(), [&](const size_t &i) {
-        Vec3f point_this_be = corr_pts_[i].head<3>();
-        Vec3f point_this = off_R * point_this_be + off_t;
-        Mat3f point_crossmat = math::SKEW_SYM_MATRIX(point_this);
-
-        /*** get the normal vector of closest surface/corner ***/
-        Vec3f norm_vec = corr_norm_[i].head<3>();
-
-        /*** calculate the Measurement Jacobian matrix H ***/
-        Vec3f C(Rt * norm_vec);
-        Vec3f A(point_crossmat * C);
-
-        Eigen::Matrix<double, 1, ESKF::pose_obs_dim_> J;
-        J.setZero();
-        J << norm_vec[0], norm_vec[1], norm_vec[2], A[0], A[1], A[2];
-
-        float res = -corr_pts_[i][3];
-
-        // double w = huber_weight(res);
-        double w = 1.0;
-
-        JTJ[i] = (J.transpose() * J).eval() * w;
-        JTr[i] = J.transpose() * res * w;
-
-        res_sq[i] = res * res;
-    });
-
-    for (int i = 0; i < index.size(); ++i) {
-        obs.HTH_ += JTJ[i] * options_.plane_icp_weight_;
-        obs.HTr_ += JTr[i] * options_.plane_icp_weight_;
-    }
-
-    if (!res_sq.empty()) {
-        std::sort(res_sq.begin(), res_sq.end());
-        obs.lidar_residual_mean_ = res_sq[res_sq.size() / 2];
-        obs.lidar_residual_max_ = res_sq[res_sq.size() - 1];
-        // LOG(INFO) << "residual mean: " << obs.lidar_residual_mean_ << ", max: " << obs.lidar_residual_max_
-        //           << ", 85%: " << res_sq[res_sq.size() * 0.85];
-    }
-
-    /// 点到点ICP部分
-
-    if (options_.enable_icp_part_) {
-        JTJ.resize(cnt_pts);
-        JTr.resize(cnt_pts);
-
-        std::vector<size_t> index(cnt_pts);
-        for (size_t i = 0; i < index.size(); ++i) {
-            index[i] = i;
-        }
-
-        std::for_each(std::execution::par_unseq, index.begin(), index.end(), [&](const size_t &i) {
-            if (point_selected_icp_[i] == false) {
-                return;
-            }
-
-            /// TODO: 外参
-            Vec3d q = scan_down_body_->points[i].getVector3fMap().cast<double>();
-            Vec3d qs = scan_down_world_->points[i].getVector3fMap().cast<double>();
-
-            Eigen::Matrix<double, 3, ESKF::pose_obs_dim_> J;
-            J.setZero();
-
-            /// translation 部分
-            J.block<3, 3>(0, 0) = Mat3d::Identity();
-
-            /// rotation 部分
-            J.block<3, 3>(0, 3) = -(s.rot_.matrix() * offset_R_lidar_fixed_) * SO3::hat(q);
-
-            Vec3d e = qs - nearest_points_[i][0].getVector3fMap().cast<double>();
-
-            if (e.norm() > 0.5) {
-                point_selected_icp_[i] = false;
-                return;
-            }
-
-            JTJ[i] = J.transpose() * J;
-            JTr[i] = -J.transpose() * e;
-        });
-
-        for (int i = 0; i < cnt_pts; ++i) {
-            if (point_selected_icp_[i] == false) {
-                continue;
-            }
-            obs.HTH_ += JTJ[i] * options_.icp_weight_;
-            obs.HTr_ += JTr[i] * options_.icp_weight_;
-        }
-    }
+#endif
 }
 
 ///////////////////////////  private method /////////////////////////////////////////////////////////////////////

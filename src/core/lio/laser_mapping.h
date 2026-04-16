@@ -11,6 +11,8 @@
 #include "common/keyframe.h"
 #include "common/options.h"
 #include "core/ivox3d/ivox3d.h"
+#include "core/lidar/lidar_pipeline.h"
+#include "core/lidar/local_map.h"
 #include "core/lio/eskf.hpp"
 #include "core/lio/imu_processing.hpp"
 #include "pointcloud_preprocess.h"
@@ -51,7 +53,7 @@ class LaserMapping {
 
     EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 
-    using IVoxType = IVox<3, IVoxNodeType::DEFAULT, PointType>;
+    using IVoxType = IVox<3, IVoxNodeType::DEFAULT, PointType>;  // kept for ivox_options_ type
 
     LaserMapping(Options options = Options());
     ~LaserMapping() {
@@ -115,6 +117,35 @@ class LaserMapping {
      */
     CloudPtr GetGlobalMap(bool use_lio_pose, bool use_voxel = true, float res = 0.1);
 
+#ifdef LIGHTNING_SNAPSHOT_DEBUG
+    // ── Snapshot debug hook (Phase 0 capture tool only) ──────────────────────
+    struct CheckPoint {
+        int frame_id = -1;
+
+        // CP-1: IMU timestamps after SyncPackages
+        std::vector<double> imu_timestamps;
+
+        // CP-2: Undistorted point cloud (first 50 points)
+        std::vector<std::array<float, 3>> undistort_pts;
+
+        // CP-3: ObsModel first iteration
+        Eigen::Matrix<double, 6, 6> HTH = Eigen::Matrix<double, 6, 6>::Zero();
+        Eigen::Matrix<double, 6, 1> HTr = Eigen::Matrix<double, 6, 1>::Zero();
+        int valid_num = 0;
+
+        // CP-4: ESKF state after Update()
+        Vec3d pos{Vec3d::Zero()}, vel{Vec3d::Zero()}, bg{Vec3d::Zero()};
+        Eigen::Quaterniond rot{Eigen::Quaterniond::Identity()};
+
+        // CP-5: Keyframe (only valid when is_keyframe == true)
+        bool is_keyframe = false;
+        Vec3d kf_pos{Vec3d::Zero()};
+        Eigen::Quaterniond kf_rot{Eigen::Quaterniond::Identity()};
+    };
+    using DebugCallback = std::function<void(const CheckPoint&)>;
+    void SetDebugCallback(DebugCallback cb) { debug_cb_ = std::move(cb); }
+#endif
+
    private:
     // sync lidar with imu
     bool SyncPackages();
@@ -147,12 +178,15 @@ class LaserMapping {
 
     /// modules
     IVoxType::Options ivox_options_;
-    std::shared_ptr<IVoxType> ivox_ = nullptr;                    // localmap in ivox
+    std::shared_ptr<LocalMap>       local_map_       = nullptr;  // thread-safe local map (Phase 1)
+    std::shared_ptr<LidarPipeline>  lidar_pipeline_  = nullptr;  // lidar processing (Phase 2)
     std::shared_ptr<PointCloudPreprocess> preprocess_ = nullptr;  // point cloud preprocess
     std::shared_ptr<ImuProcess> p_imu_ = nullptr;                 // imu process
 
     /// local map related
     double filter_size_map_min_ = 0;
+    float esti_plane_threshold_ = 0.1f;  // Phase 3: loaded from YAML, passed to LidarPipeline
+    int num_max_iterations_ = 4;          // Phase 3: loaded from YAML, passed to ESKF
 
     /// params
     std::vector<double> extrinT_{3, 0.0};  // lidar-imu translation
@@ -171,16 +205,8 @@ class LaserMapping {
     CloudPtr scan_down_world_{new PointCloudType()};  // downsampled scan in world
     pcl::VoxelGrid<PointType> voxel_scan_;            // voxel filter for current scan
 
-    /// 点面相关
+    /// 点面相关 (observation buffers now owned by lidar_pipeline_)
     std::vector<PointVector> nearest_points_;  // nearest points of current scan
-    std::vector<Vec4f> corr_pts_;              // inlier pts
-    std::vector<Vec4f> corr_norm_;             // inlier plane norms
-    std::vector<float> residuals_;             // point-to-plane residuals
-    std::vector<char> point_selected_surf_;    // selected points
-    std::vector<Vec4f> plane_coef_;            // plane coeffs
-
-    /// 点到点相关
-    std::vector<char> point_selected_icp_;  // 点到点的selected points
 
     std::mutex mtx_buffer_;
     std::deque<double> time_buffer_;
@@ -208,7 +234,7 @@ class LaserMapping {
     bool flg_EKF_inited_ = false;
     double lidar_mean_scantime_ = 0.0;
     int scan_num_ = 0;
-    int effect_feat_surf_ = 0, frame_num_ = 0, effect_feat_icp_ = 0;
+    int frame_num_ = 0;
 
     double last_lidar_time_ = 0;
 
@@ -225,6 +251,12 @@ class LaserMapping {
     std::list<Keyframe::Ptr> proj_kfs_;  // 投影到当前帧的关键帧
 
     std::shared_ptr<ui::PangolinWindow> ui_ = nullptr;
+
+#ifdef LIGHTNING_SNAPSHOT_DEBUG
+    DebugCallback debug_cb_;
+    CheckPoint    debug_cp_;
+    bool          debug_obs_first_call_ = true;  // reset at start of each Run()
+#endif
 };
 
 }  // namespace lightning

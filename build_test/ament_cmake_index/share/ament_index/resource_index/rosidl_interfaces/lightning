@@ -1,0 +1,8 @@
+srv/LocCmd.idl
+srv/LocCmd.srv
+srv/LocCmd_Request.msg
+srv/LocCmd_Response.msg
+srv/SaveMap.idl
+srv/SaveMap.srv
+srv/SaveMap_Request.msg
+srv/SaveMap_Response.msg

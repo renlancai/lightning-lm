@@ -5,6 +5,7 @@
 #ifndef LIGHTNING_LOC_SYSTEM_H
 #define LIGHTNING_LOC_SYSTEM_H
 
+#include <geometry_msgs/msg/transform_stamped.hpp>
 #include <tf2_ros/transform_broadcaster.h>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/imu.hpp>

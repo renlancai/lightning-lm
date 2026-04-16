@@ -308,4 +308,9 @@ void SlamSystem::Spin() {
     }
 }
 
+std::vector<Keyframe::Ptr> SlamSystem::GetAllKeyframes() const {
+    if (lio_) return lio_->GetAllKeyframes();
+    return {};
+}
+
 }  // namespace lightning

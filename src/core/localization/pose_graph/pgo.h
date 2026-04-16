@@ -3,6 +3,7 @@
 #include "common/eigen_types.h"
 #include "common/nav_state.h"
 #include "core/localization/localization_result.h"
+#include "core/gnss/gnss_rtk_handler.h"
 
 #include "pgo_impl.h"
 #include "pose_extrapolator.h"
@@ -46,6 +47,9 @@ class PGO {
 
     /// 接收激光定位信息（触发PGO优化）
     bool ProcessLidarLoc(const LocalizationResult& loc_result);
+
+    /// 接收 RTK 观测（经过 GnssRtkHandler 过滤后的有效观测）
+    void ProcessRtk(const core::GnssRtkHandler::RtkObservation& obs);
 
     /// 处理外部组装好的一个PGO frame，将触发优化（仅在单测时外部直接调用）
     bool ProcessPGOFrame(std::shared_ptr<PGOFrame> frame);

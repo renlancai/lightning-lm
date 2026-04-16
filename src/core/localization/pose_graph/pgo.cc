@@ -11,8 +11,8 @@
 namespace lightning::loc {
 
 PGO::PGO() : impl_(new PGOImpl), pose_extrapolator_(new PoseExtrapolator) {
-    smoother_ = std::make_shared<PoseSmoother>(pgo::pgo_smooth_factor);
-    LOG(INFO) << "smoother factor: " << pgo::pgo_smooth_factor;
+    smoother_ = std::make_shared<PoseSmoother>(impl_->options_.pgo_smooth_factor);
+    LOG(INFO) << "smoother factor: " << impl_->options_.pgo_smooth_factor;
 }
 
 PGO::~PGO() = default;
@@ -311,6 +311,17 @@ bool PGO::ProcessPGOFrame(std::shared_ptr<PGOFrame> frame) {
 }
 
 std::shared_ptr<PGOFrame> PGO::GetCurrentPGOFrame() const { return impl_->current_frame_; }
+
+void PGO::ProcessRtk(const core::GnssRtkHandler::RtkObservation& obs) {
+    UL lock(impl_->data_mutex_);
+    if (!obs.valid) return;
+
+    impl_->rtk_queue_.push_back(obs);
+    while (impl_->rtk_queue_.size() >
+           static_cast<size_t>(impl_->options_.PGO_MAX_SIZE_OF_RTK_POSE_QUEUE)) {
+        impl_->rtk_queue_.pop_front();
+    }
+}
 
 bool PGO::Reset() {
     UL lock(impl_->data_mutex_);

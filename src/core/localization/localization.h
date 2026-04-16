@@ -1,9 +1,7 @@
 #pragma once
 
-#include "geometry_msgs/msg/transform_stamped.hpp"
-#include "std_msgs/msg/int32.hpp"
-
 #include "common/imu.h"
+#include "core/gnss/gnss_rtk_handler.h"
 #include "core/lio/laser_mapping.h"
 #include "core/localization/localization_result.h"
 #include "core/system/async_message_process.h"
@@ -64,6 +62,16 @@ class Localization {
     /// 由外部设置pose，适用于手动重定位
     void SetExternalPose(const Eigen::Quaterniond& q, const Eigen::Vector3d& t);
 
+    // ── Phase 5: platform-agnostic feed methods ───────────────────────────────
+
+    /// Accept a pre-converted PCL cloud (no ROS preprocessing needed).
+    /// online_mode: enqueues asynchronously; offline: processes synchronously.
+    void ProcessCloud(CloudPtr cloud);
+
+    /// Accept an RTK observation that has already passed GnssRtkHandler
+    /// Layer 1-3 filtering and forward it to the PGO backend.
+    void ProcessRtk(const core::GnssRtkHandler::RtkObservation& obs);
+
     /// TODO: 其他初始化逻辑
 
     /// TODO: 处理odom消息
@@ -75,18 +83,14 @@ class Localization {
     void LidarOdomProcCloud(CloudPtr);
     void LidarLocProcCloud(CloudPtr);
 
-    using TFCallback = std::function<void(const geometry_msgs::msg::TransformStamped& odom)>;
-    using LocStateCallback = std::function<void(const std_msgs::msg::Int32& state)>;
-    using PointcloudBodyCallback = std::function<void(const sensor_msgs::msg::PointCloud2& pointcloud)>;
-    using PointcloudWorldCallback = std::function<void(const sensor_msgs::msg::PointCloud2& pointcloud)>;
+    using TFCallback = std::function<void(const SE3& pose, double timestamp)>;
 
     void SetTFCallback(TFCallback&& callback);
 
-    // void SetPathCallback(std::function<void(const nav_msgs::msg::Path& path)>&& callback);
-    // void SetPointcloudWorldCallback(std::function<void(const sensor_msgs::msg::PointCloud2& pointcloud)>&& callback);
-    // void SetPointcloudBodyCallback(std::function<void(const sensor_msgs::msg::PointCloud2& pointcloud)>&& callback);
-    // void SetLocStateCallback(std::function<void(const std_msgs::msg::Int32& state)>&& callback);
-    // void SetHealthDiagNormalCallback(interface::health_diag_normal_callback&& callback);
+    // void SetPathCallback(...)
+    // void SetPointcloudWorldCallback(...)
+    // void SetPointcloudBodyCallback(...)
+    // void SetLocStateCallback(...)
 
    private:
     /// 模块  ========================================================================================================
@@ -118,9 +122,6 @@ class Localization {
 
     /// 框架相关
     TFCallback tf_callback_;
-    LocStateCallback loc_state_callback_;
-    PointcloudBodyCallback pointcloud_body_callback_;
-    PointcloudWorldCallback pointcloud_world_callback_;
 
     /// 输入检查
     double last_imu_time_ = 0;
